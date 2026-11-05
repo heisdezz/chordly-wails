@@ -1,0 +1,241 @@
+[TSK-101 NOTE — FILE TEMPORARILY DISABLED]
+This file is the verbatim copy of ../chord/internal/ytm/service.go (module imports
+already renamed chordly/... -> go-chordly/...; bytes otherwise unmodified).
+It is excluded from compilation ONLY because it imports go-chordly/internal/state
+(gogpu signal-based state), which does not exist in the Wails port yet. Do NOT
+attempt the decoupling here: TSK-102 (WS-YTM, internal/ytm/service.go) owns stripping
+the push methods (SyncHomeData, LiveSearch, StartRadioForTrack,
+FetchRadioContinuation) and re-enabling this file as service.go.
+Everything else in this package compiles and tests without it.
+
+--- original content below ---
+package ytm
+
+import (
+	"context"
+	"log"
+	"sync"
+	"time"
+
+	"go-chordly/internal/model"
+	"go-chordly/internal/state"
+)
+
+// Service provides a synchronized bridge between InnerTube and the UI reactive state.
+type Service struct {
+	client            *Client
+	player            *PlayerService
+	mu                sync.Mutex
+	continuationToken string
+}
+
+var DefaultService = NewService()
+
+func NewService() *Service {
+	return &Service{
+		client: NewClient(),
+		player: DefaultPlayerService,
+	}
+}
+
+// Client returns the underlying InnerTube client.
+func (s *Service) Client() *Client {
+	return s.client
+}
+
+// Player returns the underlying Player stream resolver service.
+func (s *Service) Player() *PlayerService {
+	return s.player
+}
+
+// SetAuth applies an imported YouTube Music session to all service clients.
+// Passing nil returns the service to guest mode.
+func (s *Service) SetAuth(bundle *TokenBundle) {
+	s.client.SetAuth(bundle)
+	if s.player != nil {
+		s.player.SetAuth(bundle)
+	}
+	if bundle == nil {
+		log.Printf("[YTM] session cleared")
+		return
+	}
+	log.Printf("[YTM] session applied: %s", bundle.Summary())
+}
+
+// ClearAuth removes the session from all clients.
+func (s *Service) ClearAuth() {
+	s.SetAuth(nil)
+}
+
+// IsLoggedIn reports whether a session is attached to the service.
+func (s *Service) IsLoggedIn() bool {
+	return s.client.HasAuth()
+}
+
+// PrepareTrackStream resolves and attaches the playable audio stream URL to a track.
+func (s *Service) PrepareTrackStream(ctx context.Context, track *model.Track) error {
+	if track.StreamURL != "" {
+		return nil
+	}
+	url, err := s.player.ResolveStreamURL(ctx, track.ID)
+	if err != nil {
+		return err
+	}
+	track.StreamURL = url
+	return nil
+}
+
+// SyncHomeData asynchronously loads live YouTube Music content into reactive signals.
+func (s *Service) SyncHomeData(ctx context.Context) {
+	go func() {
+		feedCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		feed, err := s.client.GetHomeFeed(feedCtx)
+		if err != nil {
+			log.Printf("[YTM] Home feed fetch notice (using cache/defaults): %v", err)
+			return
+		}
+
+		// Update Mix cards if returned
+		if len(feed.Mixes) > 0 {
+			max := len(feed.Mixes)
+			if max > 5 {
+				max = 5
+			}
+			state.MadeForYouMixes.Set(feed.Mixes[:max])
+		}
+
+		// Update New Releases & Queue if tracks returned
+		if len(feed.Tracks) > 0 {
+			maxReleases := len(feed.Tracks)
+			if maxReleases > 4 {
+				maxReleases = 4
+			}
+			state.NewReleases.Set(feed.Tracks[:maxReleases])
+
+			// Populate queue with live tracks
+			state.Queue.Set(feed.Tracks)
+
+			// Update Hero song
+			if feed.HeroTrack != nil {
+				state.CurrentTrack.Set(*feed.HeroTrack)
+				state.Playhead.Set(0)
+				// Pre-resolve stream for hero track in background
+				go func(t model.Track) {
+					resCtx, resCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer resCancel()
+					if err := s.PrepareTrackStream(resCtx, &t); err == nil {
+						state.CurrentTrack.Set(t)
+					}
+				}(*feed.HeroTrack)
+			}
+			log.Printf("[YTM] Successfully synchronized %d live tracks from YouTube Music", len(feed.Tracks))
+		}
+	}()
+}
+
+// LiveSearch queries YouTube Music and updates the queue with real search hits.
+func (s *Service) LiveSearch(ctx context.Context, query string) {
+	go func() {
+		searchCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		defer cancel()
+
+		tracks, err := s.client.Search(searchCtx, query)
+		if err != nil {
+			log.Printf("[YTM] Search error for %q: %v", query, err)
+			return
+		}
+
+		if len(tracks) > 0 {
+			state.Queue.Set(tracks)
+			state.QueueIndex.Set(0)
+			state.CurrentTrack.Set(tracks[0])
+			state.Playhead.Set(0)
+
+			// Pre-resolve stream URL for top hit
+			go func(t model.Track) {
+				resCtx, resCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer resCancel()
+				if err := s.PrepareTrackStream(resCtx, &t); err == nil {
+					state.CurrentTrack.Set(t)
+				}
+			}(tracks[0])
+
+			log.Printf("[YTM] Search for %q loaded %d live tracks", query, len(tracks))
+		}
+	}()
+}
+
+// GetAlbum fetches album details and tracks from InnerTube.
+func (s *Service) GetAlbum(ctx context.Context, albumID string) (*AlbumDetails, error) {
+	return s.client.GetAlbum(ctx, albumID)
+}
+
+// GetArtist fetches artist details, top songs, and discography from InnerTube.
+func (s *Service) GetArtist(ctx context.Context, artistID string) (*ArtistDetails, error) {
+	return s.client.GetArtist(ctx, artistID)
+}
+
+// GetPlaylist fetches playlist or mix details and tracks from InnerTube.
+func (s *Service) GetPlaylist(ctx context.Context, playlistID string) (*PlaylistDetails, error) {
+	return s.client.GetPlaylist(ctx, playlistID)
+}
+
+// StartRadioForTrack fetches an automix radio queue for a seed track and replaces the queue.
+func (s *Service) StartRadioForTrack(ctx context.Context, videoID string) {
+	go func() {
+		radioCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		defer cancel()
+
+		res, err := s.client.GetRadio(radioCtx, videoID)
+		if err != nil {
+			log.Printf("[YTM] Radio generation notice: %v", err)
+			return
+		}
+
+		if len(res.Tracks) > 0 {
+			s.mu.Lock()
+			s.continuationToken = res.ContinuationToken
+			s.mu.Unlock()
+
+			state.Queue.Set(res.Tracks)
+			state.QueueIndex.Set(0)
+			state.CurrentTrack.Set(res.Tracks[0])
+			state.Playhead.Set(0)
+			log.Printf("[YTM] Radio seeded %d tracks for video %s", len(res.Tracks), videoID)
+		}
+	}()
+}
+
+// FetchRadioContinuation fetches the next batch of tracks when the queue runs low.
+func (s *Service) FetchRadioContinuation(ctx context.Context) {
+	s.mu.Lock()
+	token := s.continuationToken
+	s.mu.Unlock()
+
+	if token == "" {
+		return
+	}
+
+	go func() {
+		contCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		defer cancel()
+
+		res, err := s.client.GetRadioContinuation(contCtx, token)
+		if err != nil {
+			log.Printf("[YTM] Radio continuation notice: %v", err)
+			return
+		}
+
+		if len(res.Tracks) > 0 {
+			s.mu.Lock()
+			s.continuationToken = res.ContinuationToken
+			s.mu.Unlock()
+
+			curQueue := state.Queue.Get()
+			state.Queue.Set(append(curQueue, res.Tracks...))
+			log.Printf("[YTM] Appended %d continuation radio tracks", len(res.Tracks))
+		}
+	}()
+}

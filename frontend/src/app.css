@@ -1,0 +1,20 @@
+@import 'tailwindcss';
+
+@plugin 'daisyui' {
+  themes: light --default, dark --prefersdark;
+}
+
+/* TSK-001 scaffold: minimal app frame. Theme variables & palette branch
+   (artwork-derived accents) land in TSK-501 — see docs/implementation-plan.md §5/F1. */
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+}
